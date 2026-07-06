@@ -80,21 +80,31 @@ class AccessMiddleware(BaseMiddleware):
 
         if isinstance(event, Message):
             chat_id = event.chat.id
+            text = (event.text or "").strip()
         elif isinstance(event, CallbackQuery):
             chat_id = event.message.chat.id if event.message else None
+            text = ""
         else:
             chat_id = None
-
-        if config.trigger_chat_id and chat_id is not None and chat_id != config.trigger_chat_id:
-            return None
+            text = ""
 
         if not user:
             return None
 
-        if user.id in config.admin_ids:
+        is_admin = user.id in config.admin_ids
+        is_trigger_chat = bool(config.trigger_chat_id and chat_id is not None and chat_id == config.trigger_chat_id)
+        is_start_command = bool(text == "/start")
+
+        if is_admin:
             return await handler(event, data)
 
-        if chat_id == config.trigger_chat_id:
+        if not config.trigger_chat_id:
+            return await handler(event, data)
+
+        if is_trigger_chat:
+            return await handler(event, data)
+
+        if is_start_command:
             return await handler(event, data)
 
         return None
