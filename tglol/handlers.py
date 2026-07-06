@@ -646,7 +646,12 @@ async def show_accounts_menu(callback: CallbackQuery, state: FSMContext) -> None
 
 @router.callback_query(F.data == "accounts:common_sections")
 async def show_common_account_sections(callback: CallbackQuery, config: Config) -> None:
-    await _show_account_page(callback, config, "common", 0, 0)
+    clean_count, issued_count = _common_account_counts(config)
+    await callback.message.edit_text(
+        "Хранилище",
+        reply_markup=common_storage_sections_menu(clean_count=clean_count, issued_count=issued_count),
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data == "accounts:add")

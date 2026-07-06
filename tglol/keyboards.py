@@ -24,7 +24,7 @@ ACCOUNTS_PER_PAGE = 14
 def accounts_menu() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="Добавить аккаунт", callback_data="accounts:add")
-    builder.button(text="Хранилище", callback_data="accounts:page:common:0:0")
+    builder.button(text="Хранилище", callback_data="accounts:common_sections")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -140,9 +140,7 @@ def account_detail_menu(
 
 
 def common_storage_sections_menu(*, clean_count: int, issued_count: int = 0) -> InlineKeyboardMarkup:
-    total = clean_count + issued_count
     builder = InlineKeyboardBuilder()
-    builder.button(text=f"Хранилище · {total}", callback_data="accounts:page:common:0:0")
     builder.button(text=f"Чистые · {clean_count}", callback_data="accounts:page:common_clean:0:0")
     builder.button(text=f"Выданные · {issued_count}", callback_data="accounts:page:common_issued:0:0")
     builder.button(text="Назад", callback_data="accounts:menu")
