@@ -171,6 +171,31 @@ def _origin_for_account(account) -> str:
     return "common_nereg"
 
 
+def _stage_title(stage: str) -> str:
+    if stage == "nereg":
+        return "НЕРЕГ"
+    if stage == "reg":
+        return "РЕГ"
+    if stage == "issued":
+        return "ВЫДАННЫЕ"
+    if stage == "all":
+        return "Все аккаунты"
+    return "Неизвестный раздел"
+
+
+def _stage_filter_title(
+    stage: str,
+    registration_service: str | None = None,
+    excluded_service: str | None = None,
+) -> str:
+    if stage == "all":
+        return "Все аккаунты"
+    filter_label = service_filter_label(registration_service, excluded_service)
+    if filter_label == "Все":
+        return _stage_title(stage)
+    return f"{_stage_title(stage)} {filter_label}"
+
+
 def _account_connection_params(account, config: Config) -> tuple[int, str, dict[str, str]]:
     data = None
     raw_path = account.json_original_path or account.json_effective_path
