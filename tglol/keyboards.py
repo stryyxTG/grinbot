@@ -151,7 +151,7 @@ def account_detail_menu(
     return builder.as_markup()
 
 
-def common_storage_sections_menu(*, nereg_count: int, reg_count: int, issued_count: int) -> InlineKeyboardMarkup:
+def common_storage_sections_menu(*, nereg_count: int, reg_count: int, issued_count: int = 0) -> InlineKeyboardMarkup:
     total = nereg_count + reg_count + issued_count
     builder = InlineKeyboardBuilder()
     builder.button(text=f"Хранилище · {total}", callback_data="accounts:page:common:0:0")

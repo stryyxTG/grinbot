@@ -1415,14 +1415,14 @@ async def confirm_delete_account(callback: CallbackQuery, config: Config) -> Non
     stage = account.account_stage
     removed_files = _delete_local_account_files(config, [account])
     delete_account_row(config, account.id)
-    nereg_count, reg_count = _common_account_counts(config)
+    nereg_count, reg_count, issued_count = _common_account_counts(config)
     await callback.message.edit_text(
         (
             f"Аккаунт #{account.id} удален из бота.\n"
             f"Файлов удалено с сервера: {removed_files}\n\n"
-            f"Хранилище\nНЕРЕГ: {nereg_count}\nРЕГ: {reg_count}"
+            f"Хранилище\nНЕРЕГ: {nereg_count}\nРЕГ: {reg_count}\nВЫДАННЫЕ: {issued_count}"
         ),
-        reply_markup=common_storage_sections_menu(nereg_count=nereg_count, reg_count=reg_count),
+        reply_markup=common_storage_sections_menu(nereg_count=nereg_count, reg_count=reg_count, issued_count=issued_count),
     )
     await callback.answer(f"Удалено из {_stage_title(stage)}.")
 
@@ -1508,15 +1508,15 @@ async def confirm_delete_common_stage(callback: CallbackQuery, config: Config) -
             registration_service=registration_service,
             excluded_registration_service=excluded_service,
         )
-    nereg_count, reg_count = _common_account_counts(config)
+    nereg_count, reg_count, issued_count = _common_account_counts(config)
     await callback.message.edit_text(
         (
             f"{_stage_filter_title(stage, registration_service, excluded_service)} очищен.\n"
             f"Аккаунтов удалено из бота: {removed_rows}\n"
             f"Файлов удалено с сервера: {removed_files}\n\n"
-            f"Хранилище\nНЕРЕГ: {nereg_count}\nРЕГ: {reg_count}"
+            f"Хранилище\nНЕРЕГ: {nereg_count}\nРЕГ: {reg_count}\nВЫДАННЫЕ: {issued_count}"
         ),
-        reply_markup=common_storage_sections_menu(nereg_count=nereg_count, reg_count=reg_count),
+        reply_markup=common_storage_sections_menu(nereg_count=nereg_count, reg_count=reg_count, issued_count=issued_count),
     )
     await callback.answer("Раздел очищен.")
 
