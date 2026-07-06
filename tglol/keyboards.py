@@ -57,31 +57,19 @@ def _account_label(account) -> str:
 
 
 def _origin_stage(origin: str) -> str | None:
-    if origin == "common_nereg":
-        return "nereg"
-    if origin == "common_reg" or parse_reg_origin(origin) is not None:
-        return "reg"
+    if origin in {"common", "common_clean"}:
+        return "clean"
+    if origin == "common_issued":
+        return "issued"
     return None
 
 
 def _origin_to_stage_filter(origin: str) -> tuple[str, str]:
-    if origin == "common":
-        return "all", "all"
-    if origin == "common_nereg":
-        return "nereg", "all"
-    if origin == "common_reg":
-        return "reg", "all"
+    if origin in {"common", "common_clean"}:
+        return "clean", "all"
     if origin == "common_issued":
         return "issued", "all"
-    parsed = parse_reg_origin(origin)
-    if parsed is None:
-        return "all", "all"
-    registration_service, excluded_service = parsed
-    if registration_service:
-        return "reg", registration_service
-    if excluded_service:
-        return "reg", f"not_{excluded_service}"
-    return "reg", "all"
+    return "clean", "all"
 
 
 def accounts_page_keyboard(
@@ -151,13 +139,12 @@ def account_detail_menu(
     return builder.as_markup()
 
 
-def common_storage_sections_menu(*, nereg_count: int, reg_count: int, issued_count: int = 0) -> InlineKeyboardMarkup:
-    total = nereg_count + reg_count + issued_count
+def common_storage_sections_menu(*, clean_count: int, issued_count: int = 0) -> InlineKeyboardMarkup:
+    total = clean_count + issued_count
     builder = InlineKeyboardBuilder()
     builder.button(text=f"Хранилище · {total}", callback_data="accounts:page:common:0:0")
-    builder.button(text=f"НЕРЕГ · {nereg_count}", callback_data="accounts:page:common_nereg:0:0")
-    builder.button(text=f"РЕГ · {reg_count}", callback_data="accounts:page:common_reg:0:0")
-    builder.button(text=f"ВЫДАННЫЕ · {issued_count}", callback_data="accounts:page:common_issued:0:0")
+    builder.button(text=f"Чистые · {clean_count}", callback_data="accounts:page:common_clean:0:0")
+    builder.button(text=f"Выданные · {issued_count}", callback_data="accounts:page:common_issued:0:0")
     builder.button(text="Назад", callback_data="accounts:menu")
     builder.adjust(1)
     return builder.as_markup()
@@ -185,7 +172,12 @@ def confirm_delete_common_stage_menu(
     excluded_service: str | None = None,
 ) -> InlineKeyboardMarkup:
     service_part = service_filter_value(registration_service, excluded_service)
-    cancel_origin = reg_origin(registration_service, excluded_service) if stage == "reg" else f"common_{stage}"
+    if stage == "clean":
+        cancel_origin = "common_clean"
+    elif stage == "issued":
+        cancel_origin = "common_issued"
+    else:
+        cancel_origin = f"common_{stage}"
     builder = InlineKeyboardBuilder()
     builder.button(text="ДА, УДАЛИТЬ ВСЕ", callback_data=f"accounts:delete_common_confirm:{stage}:{service_part}")
     builder.button(text="Отмена", callback_data=f"accounts:page:{cancel_origin}:0:0")

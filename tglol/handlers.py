@@ -136,48 +136,39 @@ def _username(value) -> str:
     return f"<code>{escape(username)}</code>"
 
 
-def _common_account_counts(config: Config) -> tuple[int, int, int]:
-    nereg_count = count_accounts_by_stage(config, account_stage="nereg")
-    reg_count = count_accounts_by_stage(config, account_stage="reg")
+def _common_account_counts(config: Config) -> tuple[int, int]:
+    clean_count = count_accounts_by_stage(config, excluded_account_stage="issued")
     issued_count = count_accounts_by_stage(config, account_stage="issued")
-    return nereg_count, reg_count, issued_count
+    return clean_count, issued_count
 
 
 def _origin_stage(origin: str) -> str | None:
-    if origin == "common_nereg":
-        return "nereg"
-    if origin == "common_reg":
-        return "reg"
+    if origin in {"common", "common_clean"}:
+        return "clean"
     if origin == "common_issued":
         return "issued"
     return None
 
 
 def _origin_service_filters(origin: str) -> tuple[str | None, str | None]:
-    if origin in {"common", "common_nereg", "common_reg", "common_issued"}:
-        return None, None
-    return parse_reg_origin(origin)
+    return None, None
 
 
 def _origin_is_valid(origin: str) -> bool:
-    return origin in {"common", "common_nereg", "common_reg", "common_issued"} or parse_reg_origin(origin) is not None
+    return origin in {"common", "common_clean", "common_issued"}
 
 
 def _origin_for_account(account) -> str:
     if account.account_stage == "issued":
         return "common_issued"
-    if account.account_stage == "reg":
-        return "common_reg"
-    return "common_nereg"
+    return "common"
 
 
 def _stage_title(stage: str) -> str:
-    if stage == "nereg":
-        return "НЕРЕГ"
-    if stage == "reg":
-        return "РЕГ"
+    if stage == "clean":
+        return "Чистые"
     if stage == "issued":
-        return "ВЫДАННЫЕ"
+        return "Выданные"
     if stage == "all":
         return "Все аккаунты"
     return "Неизвестный раздел"
@@ -190,6 +181,10 @@ def _stage_filter_title(
 ) -> str:
     if stage == "all":
         return "Все аккаунты"
+    if stage == "clean":
+        return _stage_title(stage)
+    if stage == "issued":
+        return _stage_title(stage)
     filter_label = service_filter_label(registration_service, excluded_service)
     if filter_label == "Все":
         return _stage_title(stage)
@@ -466,27 +461,35 @@ async def _show_account_page(callback: CallbackQuery, config: Config, origin: st
         return
 
     stage = _origin_stage(origin)
-    registration_service, excluded_registration_service = _origin_service_filters(origin)
 
     if stage is None:
         total = count_accounts(config)
+    elif stage == "clean":
+        total = count_accounts_by_stage(config, excluded_account_stage="issued")
     else:
-        total = count_accounts_by_stage(
-            config,
-            account_stage=stage,
-            registration_service=registration_service,
-            excluded_registration_service=excluded_registration_service,
-        )
+        total = count_accounts_by_stage(config, account_stage=stage)
 
     page = max(0, min(page, _pages(total) - 1))
-    accounts = list_accounts(
-        config,
-        limit=ACCOUNTS_PER_PAGE,
-        offset=page * ACCOUNTS_PER_PAGE,
-        account_stage=stage,
-        registration_service=registration_service,
-        excluded_registration_service=excluded_registration_service,
-    )
+    if stage == "clean":
+        accounts = list_accounts(
+            config,
+            limit=ACCOUNTS_PER_PAGE,
+            offset=page * ACCOUNTS_PER_PAGE,
+            excluded_account_stage="issued",
+        )
+    elif stage is None:
+        accounts = list_accounts(
+            config,
+            limit=ACCOUNTS_PER_PAGE,
+            offset=page * ACCOUNTS_PER_PAGE,
+        )
+    else:
+        accounts = list_accounts(
+            config,
+            limit=ACCOUNTS_PER_PAGE,
+            offset=page * ACCOUNTS_PER_PAGE,
+            account_stage=stage,
+        )
 
     title = "Хранилище"
     if total == 0:
@@ -1366,26 +1369,15 @@ async def download_common_stage_zip(callback: CallbackQuery, config: Config) -> 
     parts = callback.data.split(":")
     stage = parts[2] if len(parts) > 2 else ""
     raw_filter = parts[3] if len(parts) > 3 else "all"
-    if stage == "all":
-        if raw_filter != "all":
-            await callback.answer("Фильтр недоступен для всех аккаунтов.", show_alert=True)
-            return
-        accounts = list_accounts_by_scope(config)
+    registration_service: str | None = None
+    excluded_service: str | None = None
+    if stage == "clean":
+        accounts = list_accounts_by_scope(config, excluded_account_stage="issued")
+    elif stage == "issued":
+        accounts = list_accounts_by_scope(config, account_stage="issued")
     else:
-        service_filter = parse_service_filter(raw_filter)
-        if stage not in {"nereg", "reg"}:
-            await callback.answer("Неизвестный раздел.", show_alert=True)
-            return
-        if service_filter is None:
-            await callback.answer("Неизвестный сервис.", show_alert=True)
-            return
-        registration_service, excluded_service = service_filter
-        accounts = list_accounts_by_scope(
-            config,
-            account_stage=stage,
-            registration_service=registration_service,
-            excluded_registration_service=excluded_service,
-        )
+        await callback.answer("Неизвестный раздел.", show_alert=True)
+        return
     if not accounts:
         await callback.answer("В этом разделе нет аккаунтов.", show_alert=True)
         return
@@ -1438,14 +1430,14 @@ async def confirm_delete_account(callback: CallbackQuery, config: Config) -> Non
     stage = account.account_stage
     removed_files = _delete_local_account_files(config, [account])
     delete_account_row(config, account.id)
-    nereg_count, reg_count, issued_count = _common_account_counts(config)
+    clean_count, issued_count = _common_account_counts(config)
     await callback.message.edit_text(
         (
             f"Аккаунт #{account.id} удален из бота.\n"
             f"Файлов удалено с сервера: {removed_files}\n\n"
-            f"Хранилище\nНЕРЕГ: {nereg_count}\nРЕГ: {reg_count}\nВЫДАННЫЕ: {issued_count}"
+            f"Хранилище\nЧистые: {clean_count}\nВыданные: {issued_count}"
         ),
-        reply_markup=common_storage_sections_menu(nereg_count=nereg_count, reg_count=reg_count, issued_count=issued_count),
+        reply_markup=common_storage_sections_menu(clean_count=clean_count, issued_count=issued_count),
     )
     await callback.answer(f"Удалено из {_stage_title(stage)}.")
 
@@ -1455,26 +1447,15 @@ async def ask_delete_common_stage(callback: CallbackQuery, config: Config) -> No
     parts = callback.data.split(":")
     stage = parts[2] if len(parts) > 2 else ""
     raw_filter = parts[3] if len(parts) > 3 else "all"
-    if stage == "all":
-        if raw_filter != "all":
-            await callback.answer("Фильтр недоступен для всех аккаунтов.", show_alert=True)
-            return
-        total = count_accounts(config)
+    registration_service: str | None = None
+    excluded_service: str | None = None
+    if stage == "clean":
+        total = count_accounts_by_stage(config, excluded_account_stage="issued")
+    elif stage == "issued":
+        total = count_accounts_by_stage(config, account_stage="issued")
     else:
-        service_filter = parse_service_filter(raw_filter)
-        if stage not in {"nereg", "reg"}:
-            await callback.answer("Неизвестный раздел.", show_alert=True)
-            return
-        if service_filter is None:
-            await callback.answer("Неизвестный сервис.", show_alert=True)
-            return
-        registration_service, excluded_service = service_filter
-        total = count_accounts_by_stage(
-            config,
-            account_stage=stage,
-            registration_service=registration_service,
-            excluded_registration_service=excluded_service,
-        )
+        await callback.answer("Неизвестный раздел.", show_alert=True)
+        return
     if not total:
         await callback.answer("В этом разделе нет аккаунтов.", show_alert=True)
         return
@@ -1493,53 +1474,34 @@ async def confirm_delete_common_stage(callback: CallbackQuery, config: Config) -
     parts = callback.data.split(":")
     stage = parts[2] if len(parts) > 2 else ""
     raw_filter = parts[3] if len(parts) > 3 else "all"
-    if stage == "all":
-        if raw_filter != "all":
-            await callback.answer("Фильтр недоступен для всех аккаунтов.", show_alert=True)
-            return
-        accounts = list_accounts_by_scope(config)
-        if not accounts:
-            await callback.answer("В хранилище нет аккаунтов.", show_alert=True)
-            return
-        removed_files = _delete_local_account_files(config, accounts)
-        removed_rows = 0
-        with connect(config) as connection:
-            cursor = connection.execute("DELETE FROM accounts")
-            removed_rows = int(cursor.rowcount or 0)
-    else:
-        service_filter = parse_service_filter(raw_filter)
-        if stage not in {"nereg", "reg"}:
-            await callback.answer("Неизвестный раздел.", show_alert=True)
-            return
-        if service_filter is None:
-            await callback.answer("Неизвестный сервис.", show_alert=True)
-            return
-        registration_service, excluded_service = service_filter
-        accounts = list_accounts_by_scope(
-            config,
-            account_stage=stage,
-            registration_service=registration_service,
-            excluded_registration_service=excluded_service,
-        )
+    registration_service: str | None = None
+    excluded_service: str | None = None
+    if stage == "clean":
+        accounts = list_accounts_by_scope(config, excluded_account_stage="issued")
         if not accounts:
             await callback.answer("В этом разделе нет аккаунтов.", show_alert=True)
             return
         removed_files = _delete_local_account_files(config, accounts)
-        removed_rows = delete_accounts_by_stage(
-            config,
-            account_stage=stage,
-            registration_service=registration_service,
-            excluded_registration_service=excluded_service,
-        )
-    nereg_count, reg_count, issued_count = _common_account_counts(config)
+        removed_rows = delete_accounts_by_stage(config, excluded_account_stage="issued")
+    elif stage == "issued":
+        accounts = list_accounts_by_scope(config, account_stage="issued")
+        if not accounts:
+            await callback.answer("В этом разделе нет аккаунтов.", show_alert=True)
+            return
+        removed_files = _delete_local_account_files(config, accounts)
+        removed_rows = delete_accounts_by_stage(config, account_stage="issued")
+    else:
+        await callback.answer("Неизвестный раздел.", show_alert=True)
+        return
+    clean_count, issued_count = _common_account_counts(config)
     await callback.message.edit_text(
         (
-            f"{_stage_filter_title(stage, registration_service, excluded_service)} очищен.\n"
+            f"{_stage_filter_title(stage, None, None)} очищен.\n"
             f"Аккаунтов удалено из бота: {removed_rows}\n"
             f"Файлов удалено с сервера: {removed_files}\n\n"
-            f"Хранилище\nНЕРЕГ: {nereg_count}\nРЕГ: {reg_count}\nВЫДАННЫЕ: {issued_count}"
+            f"Хранилище\nЧистые: {clean_count}\nВыданные: {issued_count}"
         ),
-        reply_markup=common_storage_sections_menu(nereg_count=nereg_count, reg_count=reg_count, issued_count=issued_count),
+        reply_markup=common_storage_sections_menu(clean_count=clean_count, issued_count=issued_count),
     )
     await callback.answer("Раздел очищен.")
 

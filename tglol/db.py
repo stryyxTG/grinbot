@@ -110,6 +110,7 @@ def list_accounts(
     limit: int = 20,
     offset: int = 0,
     account_stage: str | None = None,
+    excluded_account_stage: str | None = None,
     registration_service: str | None = None,
     excluded_registration_service: str | None = None,
 ) -> list[Account]:
@@ -118,6 +119,9 @@ def list_accounts(
     if account_stage is not None:
         clauses.append("account_stage = ?")
         params.append(account_stage)
+    if excluded_account_stage is not None:
+        clauses.append("account_stage != ?")
+        params.append(excluded_account_stage)
     if registration_service is not None:
         clauses.append("instr(',' || coalesce(nullif(registration_services, ''), registration_service, '') || ',', ?) > 0")
         params.append(f",{registration_service},")
@@ -167,6 +171,7 @@ def count_accounts(config: Config) -> int:
 def count_accounts_by_stage(
     config: Config,
     account_stage: str | None = None,
+    excluded_account_stage: str | None = None,
     registration_service: str | None = None,
     excluded_registration_service: str | None = None,
 ) -> int:
@@ -175,6 +180,9 @@ def count_accounts_by_stage(
     if account_stage is not None:
         clauses.append("account_stage = ?")
         params.append(account_stage)
+    if excluded_account_stage is not None:
+        clauses.append("account_stage != ?")
+        params.append(excluded_account_stage)
     if registration_service is not None:
         clauses.append("instr(',' || coalesce(nullif(registration_services, ''), registration_service, '') || ',', ?) > 0")
         params.append(f",{registration_service},")
@@ -236,14 +244,21 @@ def delete_account_row(config: Config, account_id: int) -> None:
 def delete_accounts_by_stage(
     config: Config,
     *,
-    account_stage: str,
+    account_stage: str | None = None,
+    excluded_account_stage: str | None = None,
     registration_service: str | None = None,
     excluded_registration_service: str | None = None,
 ) -> int:
-    if account_stage not in {"nereg", "reg"}:
-        raise ValueError("unknown account stage")
-    clauses = ["account_stage = ?"]
-    params: list[Any] = [account_stage]
+    clauses: list[str] = []
+    params: list[Any] = []
+    if account_stage is not None:
+        if account_stage not in {"nereg", "reg", "issued"}:
+            raise ValueError("unknown account stage")
+        clauses.append("account_stage = ?")
+        params.append(account_stage)
+    if excluded_account_stage is not None:
+        clauses.append("account_stage != ?")
+        params.append(excluded_account_stage)
     if registration_service is not None:
         clauses.append("instr(',' || coalesce(nullif(registration_services, ''), registration_service, '') || ',', ?) > 0")
         params.append(f",{registration_service},")
