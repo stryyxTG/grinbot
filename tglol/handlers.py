@@ -16,7 +16,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message, TelegramObject
 from telethon.errors import SessionPasswordNeededError
 
-from tglol.bulk_input import parse_bulk_phone_code_input
+from tglol.bulk_input import parse_bulk_phone_code_input, parse_bulk_phone_input
 from tglol.config import Config
 from tglol.db import (
     add_account,
@@ -602,24 +602,34 @@ async def add_by_code_start(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "accounts:add:bulk_code")
 async def add_bulk_code_start(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(AddByBulkCode.waiting_bulk_input)
+    await state.set_state(AddByBulkCode.waiting_phones)
     await callback.message.edit_text(
-        "Отправь номера и коды массово.\n\nФормат:\nномер1\nномер2\n\nкод1\nкод2\n\nВажно: коды должны идти в том же порядке, что и номера."
+        "Отправь номера массово.\n\nФормат:\nномер1\nномер2\nномер3"
     )
     await callback.answer()
 
 
-@router.message(AddByBulkCode.waiting_bulk_input)
+@router.message(AddByBulkCode.waiting_phones)
 async def add_bulk_code_input(message: Message, state: FSMContext, config: Config) -> None:
-    pairs = parse_bulk_phone_code_input(message.text or "")
-    if not pairs:
-        await message.answer("Не удалось прочитать список. Используй формат:\nномер1\nномер2\n\nкод1\nкод2")
+    text = message.text or ""
+    full_pairs = parse_bulk_phone_code_input(text)
+    if full_pairs:
+        await _process_bulk_phone_code_pairs(message, state, config, full_pairs)
         return
 
-    created = []
-    for phone, code in pairs:
+    phones = parse_bulk_phone_input(text)
+    if not phones:
+        await message.answer(
+            "Не удалось прочитать список номеров. Отправь телефоны без кодов, например:\n+79261234567\n+79261234568"
+        )
+        return
+
+    pending: list[dict[str, str | int | dict[str, str]]] = []
+    failed: list[str] = []
+    admin_id = message.from_user.id if message.from_user else 0
+
+    for phone in phones:
         runtime = random_desktop_runtime()
-        admin_id = message.from_user.id if message.from_user else 0
         login_id = secrets.token_hex(4)
         phone_digits = phone.lstrip("+")
         session_path = unique_path(config.temp_dir, f"temp_session_{admin_id}_{phone_digits}_{login_id}.session")
@@ -632,7 +642,7 @@ async def add_bulk_code_input(message: Message, state: FSMContext, config: Confi
                 runtime,
             )
         except Exception as exc:
-            created.append(f"{phone}: ошибка отправки кода — {exc}")
+            failed.append(f"{phone}: ошибка отправки кода — {exc}")
             continue
 
         if code_request.already_authorized and code_request.user:
@@ -650,7 +660,69 @@ async def add_bulk_code_input(message: Message, state: FSMContext, config: Confi
                     clear_state=False,
                 )
             except Exception as exc:
-                created.append(f"{phone}: ошибка завершения — {exc}")
+                failed.append(f"{phone}: ошибка завершения — {exc}")
+            continue
+
+        pending.append(
+            {
+                "phone": phone,
+                "phone_code_hash": code_request.phone_code_hash,
+                "session_path": str(session_path),
+                "login_id": login_id,
+                "admin_id": admin_id,
+                "runtime": runtime,
+            }
+        )
+
+    if not pending and failed:
+        await state.clear()
+        await message.answer("Не удалось отправить код ни на один номер.\n" + "\n".join(failed[:20]))
+        return
+
+    await state.update_data(pending_bulk_accounts=pending)
+    await state.set_state(AddByBulkCode.waiting_codes)
+
+    response = "Запросы на коды отправлены. Отправь коды в том же порядке, по одной строке на номер."
+    if failed:
+        response += "\n\nНе получилось отправить код на:\n" + "\n".join(failed[:20])
+    await message.answer(response)
+
+
+@router.message(AddByBulkCode.waiting_codes)
+async def add_bulk_code_confirm(message: Message, state: FSMContext, config: Config) -> None:
+    data = await state.get_data()
+    pending = data.get("pending_bulk_accounts")
+    if not isinstance(pending, list) or not pending:
+        await state.clear()
+        await message.answer(
+            "Не найдены ожидающие номера. Начни сначала, отправив телефоны.",
+            reply_markup=accounts_menu(),
+        )
+        return
+
+    code_lines = [line.strip() for line in (message.text or "").splitlines() if line.strip()]
+    codes = [_normalize_login_code(line) for line in code_lines]
+    if not all(codes):
+        await message.answer("Коды должны быть цифрами. Отправь их снова, по одной строке на номер.")
+        return
+
+    if len(codes) != len(pending):
+        await message.answer(
+            f"Ожидаются коды для {len(pending)} номеров, а пришло {len(codes)}. Отправь коды заново."
+        )
+        return
+
+    created = []
+    for account_data, code in zip(pending, codes):
+        session_path = Path(account_data["session_path"])
+        phone = account_data["phone"]
+        login_id = account_data["login_id"]
+        runtime = account_data["runtime"]
+        admin_id = account_data.get("admin_id") or (message.from_user.id if message.from_user else 0)
+        phone_code_hash = account_data.get("phone_code_hash")
+
+        if not phone_code_hash:
+            created.append(f"{phone}: отсутствует код-хэш.")
             continue
 
         try:
@@ -658,7 +730,7 @@ async def add_bulk_code_input(message: Message, state: FSMContext, config: Confi
                 session_path,
                 phone,
                 code,
-                code_request.phone_code_hash,
+                phone_code_hash,
                 config.telegram_api_id,
                 config.telegram_api_hash,
                 runtime,
@@ -671,7 +743,7 @@ async def add_bulk_code_input(message: Message, state: FSMContext, config: Confi
             await _finalize_code_login_impl(
                 message,
                 config,
-                session_path=session_path,
+                session_path=str(session_path),
                 phone=phone,
                 login_id=login_id,
                 runtime=runtime,

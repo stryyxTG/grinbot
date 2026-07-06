@@ -66,3 +66,15 @@ def parse_bulk_phone_code_input(text: str) -> list[tuple[str, str]] | None:
         return None
 
     return list(zip(phones, codes))
+
+
+def parse_bulk_phone_input(text: str) -> list[str] | None:
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    lines = _clean_lines(lines)
+    phones: list[str] = []
+    for line in lines:
+        phone = _normalize_login_phone(line)
+        if not phone:
+            return None
+        phones.append(phone)
+    return phones if phones else None

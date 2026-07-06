@@ -8,7 +8,8 @@ class AddByCode(StatesGroup):
 
 
 class AddByBulkCode(StatesGroup):
-    waiting_bulk_input = State()
+    waiting_phones = State()
+    waiting_codes = State()
 
 
 class AddByZip(StatesGroup):
