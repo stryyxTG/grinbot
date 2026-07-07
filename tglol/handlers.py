@@ -16,7 +16,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message, TelegramObject
 from telethon.errors import SessionPasswordNeededError
 
-from tglol.bulk_input import parse_bulk_phone_code_input, parse_bulk_phone_input
+from tglol.bulk_input import parse_bulk_phone_input
 from tglol.config import Config
 from tglol.db import (
     add_account,
@@ -682,14 +682,18 @@ async def add_bulk_code_start(callback: CallbackQuery, state: FSMContext) -> Non
     await callback.answer()
 
 
+async def _edit_bulk_status(status_message: Message | None, text: str) -> None:
+    if status_message is None:
+        return
+    try:
+        await status_message.edit_text(text)
+    except Exception as exc:
+        logger.debug("Cannot edit bulk status message: %s", exc)
+
+
 @router.message(AddByBulkCode.waiting_phones)
 async def add_bulk_code_input(message: Message, state: FSMContext, config: Config) -> None:
     text = message.text or ""
-    full_pairs = parse_bulk_phone_code_input(text)
-    if full_pairs:
-        await _process_bulk_phone_code_pairs(message, state, config, full_pairs)
-        return
-
     phones = parse_bulk_phone_input(text)
     if not phones:
         await message.answer(
@@ -700,8 +704,11 @@ async def add_bulk_code_input(message: Message, state: FSMContext, config: Confi
     pending: list[dict[str, str | int | dict[str, str]]] = []
     failed: list[str] = []
     admin_id = message.from_user.id if message.from_user else 0
+    status_message = await message.answer(f"Принял {len(phones)} номеров. Отправляю коды...")
 
-    for phone in phones:
+    for index, phone in enumerate(phones, start=1):
+        if index == 1 or index % 5 == 0 or index == len(phones):
+            await _edit_bulk_status(status_message, f"Отправляю коды: {index}/{len(phones)}...")
         runtime = random_desktop_runtime()
         login_id = secrets.token_hex(4)
         phone_digits = phone.lstrip("+")
@@ -746,6 +753,8 @@ async def add_bulk_code_input(message: Message, state: FSMContext, config: Confi
                 "runtime": runtime,
             }
         )
+
+    await _edit_bulk_status(status_message, f"Отправка кодов завершена. Ожидают коды: {len(pending)}. Ошибок: {len(failed)}.")
 
     if not pending and failed:
         await state.clear()
