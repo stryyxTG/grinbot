@@ -782,6 +782,13 @@ async def add_bulk_code_confirm(message: Message, state: FSMContext, config: Con
         )
         return
 
+    new_phones = parse_bulk_phone_input(message.text or "")
+    if new_phones:
+        await message.answer("Похоже, пришла новая пачка номеров. Старое ожидание кодов отменяю.")
+        await state.set_state(AddByBulkCode.waiting_phones)
+        await add_bulk_code_input(message, state, config)
+        return
+
     code_lines = [line.strip() for line in (message.text or "").splitlines() if line.strip()]
     codes = [_normalize_login_code(line) for line in code_lines]
     if not all(codes):
