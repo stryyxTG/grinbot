@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from html import escape
 from math import ceil
 from pathlib import Path
@@ -8,6 +9,7 @@ import re
 import secrets
 import shutil
 import time
+from typing import Any
 import zipfile
 
 from aiogram import BaseMiddleware, Bot, F, Router
@@ -691,6 +693,43 @@ async def _edit_bulk_status(status_message: Message | None, text: str) -> None:
         logger.debug("Cannot edit bulk status message: %s", exc)
 
 
+async def _send_bulk_code_request(
+    account_data: dict[str, Any],
+    config: Config,
+) -> tuple[dict[str, Any], Any | None, Exception | None]:
+    try:
+        code_request = await send_code(
+            Path(str(account_data["session_path"])),
+            str(account_data["phone"]),
+            config.telegram_api_id,
+            config.telegram_api_hash,
+            account_data["runtime"],
+        )
+    except Exception as exc:
+        return account_data, None, exc
+    return account_data, code_request, None
+
+
+async def _sign_in_bulk_code(
+    account_data: dict[str, Any],
+    code: str,
+    config: Config,
+) -> tuple[dict[str, Any], Any | None, Exception | None]:
+    try:
+        user = await sign_in_code(
+            Path(str(account_data["session_path"])),
+            str(account_data["phone"]),
+            code,
+            str(account_data["phone_code_hash"]),
+            config.telegram_api_id,
+            config.telegram_api_hash,
+            account_data["runtime"],
+        )
+    except Exception as exc:
+        return account_data, None, exc
+    return account_data, user, None
+
+
 @router.message(AddByBulkCode.waiting_phones)
 async def add_bulk_code_input(message: Message, state: FSMContext, config: Config) -> None:
     text = message.text or ""
@@ -701,28 +740,35 @@ async def add_bulk_code_input(message: Message, state: FSMContext, config: Confi
         )
         return
 
-    pending: list[dict[str, str | int | dict[str, str]]] = []
+    pending: list[dict[str, Any]] = []
     failed: list[str] = []
     admin_id = message.from_user.id if message.from_user else 0
-    status_message = await message.answer(f"Принял {len(phones)} номеров. Отправляю коды...")
+    status_message = await message.answer(f"Принял {len(phones)} номеров. Отправляю запросы на коды одновременно...")
 
-    for index, phone in enumerate(phones, start=1):
-        if index == 1 or index % 5 == 0 or index == len(phones):
-            await _edit_bulk_status(status_message, f"Отправляю коды: {index}/{len(phones)}...")
+    accounts: list[dict[str, Any]] = []
+    for phone in phones:
         runtime = random_desktop_runtime()
         login_id = secrets.token_hex(4)
         phone_digits = phone.lstrip("+")
         session_path = unique_path(config.temp_dir, f"temp_session_{admin_id}_{phone_digits}_{login_id}.session")
-        try:
-            code_request = await send_code(
-                session_path,
-                phone,
-                config.telegram_api_id,
-                config.telegram_api_hash,
-                runtime,
-            )
-        except Exception as exc:
-            failed.append(f"{phone}: ошибка отправки кода — {exc}")
+        accounts.append(
+            {
+                "phone": phone,
+                "session_path": str(session_path),
+                "login_id": login_id,
+                "admin_id": admin_id,
+                "runtime": runtime,
+            }
+        )
+
+    send_results = await asyncio.gather(
+        *(_send_bulk_code_request(account_data, config) for account_data in accounts)
+    )
+
+    for account_data, code_request, error in send_results:
+        phone = str(account_data["phone"])
+        if error is not None:
+            failed.append(f"{phone}: ошибка отправки кода — {error}")
             continue
 
         if code_request.already_authorized and code_request.user:
@@ -730,11 +776,11 @@ async def add_bulk_code_input(message: Message, state: FSMContext, config: Confi
                 await _finalize_code_login_impl(
                     message,
                     config,
-                    session_path=session_path,
+                    session_path=str(account_data["session_path"]),
                     phone=phone,
-                    login_id=login_id,
-                    runtime=runtime,
-                    admin_id=admin_id,
+                    login_id=str(account_data["login_id"]),
+                    runtime=account_data["runtime"],
+                    admin_id=int(account_data["admin_id"]),
                     twofa=None,
                     user=code_request.user,
                     clear_state=False,
@@ -743,19 +789,14 @@ async def add_bulk_code_input(message: Message, state: FSMContext, config: Confi
                 failed.append(f"{phone}: ошибка завершения — {exc}")
             continue
 
-        pending.append(
-            {
-                "phone": phone,
-                "phone_code_hash": code_request.phone_code_hash,
-                "session_path": str(session_path),
-                "login_id": login_id,
-                "admin_id": admin_id,
-                "runtime": runtime,
-            }
-        )
+        if not code_request.phone_code_hash:
+            failed.append(f"{phone}: Telegram не вернул phone_code_hash.")
+            continue
 
-    await _edit_bulk_status(status_message, f"Отправка кодов завершена. Ожидают коды: {len(pending)}. Ошибок: {len(failed)}.")
+        account_data["phone_code_hash"] = code_request.phone_code_hash
+        pending.append(account_data)
 
+    await _edit_bulk_status(status_message, f"Запросы на коды завершены. Ожидают коды: {len(pending)}. Ошибок: {len(failed)}.")
     if not pending and failed:
         await state.clear()
         await message.answer("Не удалось отправить код ни на один номер.\n" + "\n".join(failed[:20]))
@@ -802,48 +843,36 @@ async def add_bulk_code_confirm(message: Message, state: FSMContext, config: Con
         return
 
     created = []
-    for account_data, code in zip(pending, codes):
-        session_path = Path(account_data["session_path"])
-        phone = account_data["phone"]
-        login_id = account_data["login_id"]
-        runtime = account_data["runtime"]
-        admin_id = account_data.get("admin_id") or (message.from_user.id if message.from_user else 0)
-        phone_code_hash = account_data.get("phone_code_hash")
+    status_message = await message.answer(f"Принял {len(codes)} кодов. Вхожу во все аккаунты одновременно...")
+    sign_in_results = await asyncio.gather(
+        *(_sign_in_bulk_code(account_data, code, config) for account_data, code in zip(pending, codes))
+    )
+    await _edit_bulk_status(status_message, "Входы по кодам завершены. Добавляю аккаунты в хранилище...")
 
-        if not phone_code_hash:
-            created.append(f"{phone}: отсутствует код-хэш.")
-            continue
-
-        try:
-            user = await sign_in_code(
-                session_path,
-                phone,
-                code,
-                phone_code_hash,
-                config.telegram_api_id,
-                config.telegram_api_hash,
-                runtime,
-            )
-        except Exception as exc:
-            created.append(f"{phone}: ошибка входа — {exc}")
+    for account_data, user, error in sign_in_results:
+        phone = str(account_data["phone"])
+        if error is not None:
+            if isinstance(error, SessionPasswordNeededError):
+                created.append(f"{phone}: нужен пароль 2FA.")
+            else:
+                created.append(f"{phone}: ошибка входа — {error}")
             continue
 
         try:
             await _finalize_code_login_impl(
                 message,
                 config,
-                session_path=str(session_path),
+                session_path=str(account_data["session_path"]),
                 phone=phone,
-                login_id=login_id,
-                runtime=runtime,
-                admin_id=admin_id,
+                login_id=str(account_data["login_id"]),
+                runtime=account_data["runtime"],
+                admin_id=account_data.get("admin_id") or (message.from_user.id if message.from_user else 0),
                 twofa=None,
                 user=user,
                 clear_state=False,
             )
         except Exception as exc:
             created.append(f"{phone}: ошибка добавления — {exc}")
-
     await state.clear()
     if created:
         await message.answer("Готово.\n\n" + "\n".join(created[:20]), reply_markup=accounts_menu())
