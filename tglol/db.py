@@ -142,6 +142,7 @@ def list_accounts_by_scope(
     config: Config,
     *,
     account_stage: str | None = None,
+    excluded_account_stage: str | None = None,
     registration_service: str | None = None,
     excluded_registration_service: str | None = None,
 ) -> list[Account]:
@@ -150,6 +151,7 @@ def list_accounts_by_scope(
         limit=100000,
         offset=0,
         account_stage=account_stage,
+        excluded_account_stage=excluded_account_stage,
         registration_service=registration_service,
         excluded_registration_service=excluded_registration_service,
     )
