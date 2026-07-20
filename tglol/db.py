@@ -30,6 +30,38 @@ CREATE TABLE IF NOT EXISTS accounts (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS workers (
+    user_id INTEGER PRIMARY KEY,
+    first_name TEXT NOT NULL,
+    last_name TEXT,
+    username TEXT,
+    remaining_limit INTEGER NOT NULL CHECK (remaining_limit >= 0),
+    configured_limit INTEGER NOT NULL CHECK (configured_limit >= 0),
+    created_by INTEGER,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS worker_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    worker_id INTEGER NOT NULL,
+    requested_count INTEGER NOT NULL,
+    issued_count INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS worker_issues (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id INTEGER NOT NULL,
+    worker_id INTEGER NOT NULL,
+    account_id INTEGER NOT NULL,
+    phone TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_worker_requests_worker_id ON worker_requests(worker_id);
+CREATE INDEX IF NOT EXISTS idx_worker_issues_worker_id ON worker_issues(worker_id);
 """
 
 
@@ -56,6 +88,38 @@ class Account:
     updated_at: str
 
 
+@dataclass(frozen=True)
+class Worker:
+    user_id: int
+    first_name: str
+    last_name: str | None
+    username: str | None
+    remaining_limit: int
+    configured_limit: int
+    created_by: int | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class WorkerStats:
+    worker: Worker
+    trigger_count: int
+    requested_count: int
+    issued_count: int
+    phones: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class WorkerResetResult:
+    worker: Worker
+    previous_remaining: int
+    restored_count: int
+    trigger_count: int
+    requested_count: int
+    issued_count: int
+
+
 def connect(config: Config) -> sqlite3.Connection:
     connection = sqlite3.connect(config.db_path)
     connection.row_factory = sqlite3.Row
@@ -68,6 +132,14 @@ def init_db(config: Config) -> None:
         _ensure_column(connection, "accounts", "account_stage", "TEXT NOT NULL DEFAULT 'nereg'")
         _ensure_column(connection, "accounts", "registration_service", "TEXT")
         _ensure_column(connection, "accounts", "registration_services", "TEXT")
+        _ensure_column(connection, "workers", "configured_limit", "INTEGER NOT NULL DEFAULT 0")
+        connection.execute(
+            """
+            UPDATE workers
+            SET configured_limit = remaining_limit
+            WHERE configured_limit = 0 AND remaining_limit > 0
+            """
+        )
         connection.execute(
             """
             UPDATE accounts
@@ -92,6 +164,255 @@ def _account_from_row(row: sqlite3.Row) -> Account:
     values = dict(row)
     names = {field.name for field in fields(Account)}
     return Account(**{name: values.get(name) for name in names})
+
+
+def _worker_from_row(row: sqlite3.Row) -> Worker:
+    return Worker(**dict(row))
+
+
+def get_worker(config: Config, user_id: int) -> Worker | None:
+    with connect(config) as connection:
+        row = connection.execute("SELECT * FROM workers WHERE user_id = ?", (user_id,)).fetchone()
+    return _worker_from_row(row) if row else None
+
+
+def list_workers(config: Config) -> list[Worker]:
+    with connect(config) as connection:
+        rows = connection.execute(
+            "SELECT * FROM workers ORDER BY first_name COLLATE NOCASE, last_name COLLATE NOCASE, user_id"
+        ).fetchall()
+    return [_worker_from_row(row) for row in rows]
+
+
+def save_worker(
+    config: Config,
+    *,
+    user_id: int,
+    first_name: str,
+    last_name: str | None,
+    username: str | None,
+    remaining_limit: int,
+    created_by: int | None,
+) -> None:
+    if remaining_limit < 0:
+        raise ValueError("worker limit cannot be negative")
+    with connect(config) as connection:
+        connection.execute(
+            """
+            INSERT INTO workers (
+                user_id, first_name, last_name, username,
+                remaining_limit, configured_limit, created_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                first_name = excluded.first_name,
+                last_name = excluded.last_name,
+                username = excluded.username,
+                remaining_limit = excluded.remaining_limit,
+                configured_limit = excluded.configured_limit,
+                updated_at = datetime('now')
+            """,
+            (user_id, first_name, last_name, username, remaining_limit, remaining_limit, created_by),
+        )
+
+
+def set_worker_limit(config: Config, user_id: int, remaining_limit: int) -> bool:
+    if remaining_limit < 0:
+        raise ValueError("worker limit cannot be negative")
+    with connect(config) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE workers
+            SET remaining_limit = ?, configured_limit = ?, updated_at = datetime('now')
+            WHERE user_id = ?
+            """,
+            (remaining_limit, remaining_limit, user_id),
+        )
+        return bool(cursor.rowcount)
+
+
+def update_worker_identity(
+    config: Config,
+    user_id: int,
+    *,
+    first_name: str,
+    last_name: str | None,
+    username: str | None,
+) -> bool:
+    with connect(config) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE workers
+            SET first_name = ?, last_name = ?, username = ?, updated_at = datetime('now')
+            WHERE user_id = ?
+            """,
+            (first_name, last_name, username, user_id),
+        )
+        return bool(cursor.rowcount)
+
+
+def delete_worker(config: Config, user_id: int) -> bool:
+    with connect(config) as connection:
+        connection.execute("DELETE FROM worker_issues WHERE worker_id = ?", (user_id,))
+        connection.execute("DELETE FROM worker_requests WHERE worker_id = ?", (user_id,))
+        cursor = connection.execute("DELETE FROM workers WHERE user_id = ?", (user_id,))
+        return bool(cursor.rowcount)
+
+
+def claim_accounts_for_worker(
+    config: Config,
+    account_ids: list[int],
+    *,
+    worker_id: int | None,
+    requested_count: int | None = None,
+) -> list[Account]:
+    """Atomically log a request, reserve accounts and consume the worker's quota."""
+    if requested_count is not None and requested_count < 0:
+        raise ValueError("requested count cannot be negative")
+    if not account_ids and worker_id is None:
+        return []
+    unique_ids = list(dict.fromkeys(account_ids))
+    requested_count = len(unique_ids) if requested_count is None else requested_count
+    with connect(config) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        allowed = len(unique_ids)
+        if worker_id is not None:
+            worker_row = connection.execute(
+                "SELECT remaining_limit FROM workers WHERE user_id = ?",
+                (worker_id,),
+            ).fetchone()
+            if not worker_row:
+                return []
+            allowed = min(allowed, int(worker_row["remaining_limit"]))
+
+        rows: list[sqlite3.Row] = []
+        if unique_ids and allowed > 0:
+            placeholders = ",".join("?" for _ in unique_ids)
+            rows = connection.execute(
+                f"SELECT * FROM accounts WHERE id IN ({placeholders}) AND account_stage != 'issued'",
+                unique_ids,
+            ).fetchall()
+        by_id = {int(row["id"]): row for row in rows}
+        claimed_ids = [account_id for account_id in unique_ids if account_id in by_id][:allowed]
+
+        request_id: int | None = None
+        if worker_id is not None:
+            cursor = connection.execute(
+                """
+                INSERT INTO worker_requests (worker_id, requested_count, issued_count)
+                VALUES (?, ?, ?)
+                """,
+                (worker_id, requested_count, len(claimed_ids)),
+            )
+            request_id = int(cursor.lastrowid)
+
+        if not claimed_ids:
+            return []
+
+        claimed_placeholders = ",".join("?" for _ in claimed_ids)
+        connection.execute(
+            f"""
+            UPDATE accounts
+            SET account_stage = 'issued', registration_service = NULL,
+                registration_services = NULL, updated_at = datetime('now')
+            WHERE id IN ({claimed_placeholders}) AND account_stage != 'issued'
+            """,
+            claimed_ids,
+        )
+        if worker_id is not None:
+            connection.execute(
+                """
+                UPDATE workers
+                SET remaining_limit = remaining_limit - ?, updated_at = datetime('now')
+                WHERE user_id = ?
+                """,
+                (len(claimed_ids), worker_id),
+            )
+            connection.executemany(
+                """
+                INSERT INTO worker_issues (request_id, worker_id, account_id, phone)
+                VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (request_id, worker_id, account_id, by_id[account_id]["phone"])
+                    for account_id in claimed_ids
+                ],
+            )
+        return [_account_from_row(by_id[account_id]) for account_id in claimed_ids]
+
+
+def _worker_stats_from_connection(connection: sqlite3.Connection) -> list[WorkerStats]:
+    worker_rows = connection.execute(
+        "SELECT * FROM workers ORDER BY first_name COLLATE NOCASE, last_name COLLATE NOCASE, user_id"
+    ).fetchall()
+    request_rows = connection.execute(
+        """
+        SELECT worker_id,
+               count(*) AS trigger_count,
+               coalesce(sum(requested_count), 0) AS requested_count,
+               coalesce(sum(issued_count), 0) AS issued_count
+        FROM worker_requests
+        GROUP BY worker_id
+        """
+    ).fetchall()
+    totals = {
+        int(row["worker_id"]): (
+            int(row["trigger_count"]), int(row["requested_count"]), int(row["issued_count"])
+        )
+        for row in request_rows
+    }
+    issue_rows = connection.execute(
+        "SELECT worker_id, phone FROM worker_issues ORDER BY id"
+    ).fetchall()
+    phones: dict[int, list[str]] = {}
+    for row in issue_rows:
+        phones.setdefault(int(row["worker_id"]), []).append(str(row["phone"] or "-"))
+
+    result: list[WorkerStats] = []
+    for row in worker_rows:
+        worker = _worker_from_row(row)
+        trigger_count, requested_count, issued_count = totals.get(worker.user_id, (0, 0, 0))
+        result.append(
+            WorkerStats(
+                worker=worker,
+                trigger_count=trigger_count,
+                requested_count=requested_count,
+                issued_count=issued_count,
+                phones=tuple(phones.get(worker.user_id, [])),
+            )
+        )
+    return result
+
+
+def list_worker_stats(config: Config) -> list[WorkerStats]:
+    with connect(config) as connection:
+        return _worker_stats_from_connection(connection)
+
+
+def reset_worker_limits(config: Config) -> list[WorkerResetResult]:
+    """Restore configured limits and start a fresh statistics period."""
+    with connect(config) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        stats = _worker_stats_from_connection(connection)
+        results = [
+            WorkerResetResult(
+                worker=item.worker,
+                previous_remaining=item.worker.remaining_limit,
+                restored_count=max(0, item.worker.configured_limit - item.worker.remaining_limit),
+                trigger_count=item.trigger_count,
+                requested_count=item.requested_count,
+                issued_count=item.issued_count,
+            )
+            for item in stats
+        ]
+        connection.execute(
+            """
+            UPDATE workers
+            SET remaining_limit = configured_limit, updated_at = datetime('now')
+            """
+        )
+        connection.execute("DELETE FROM worker_issues")
+        connection.execute("DELETE FROM worker_requests")
+        return results
 
 
 def add_account(config: Config, values: dict[str, Any]) -> int:

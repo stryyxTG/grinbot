@@ -19,6 +19,7 @@ from tglol.registration import (
 
 
 ACCOUNTS_PER_PAGE = 14
+WORKERS_PER_PAGE = 20
 
 
 def accounts_menu() -> InlineKeyboardMarkup:
@@ -241,4 +242,61 @@ def registration_filter_menu(current_origin: str) -> InlineKeyboardMarkup:
 
     builder.button(text="Назад к списку", callback_data=f"accounts:page:{current_origin}:0:0")
     builder.adjust(1, 2, 2, 2, 1)
+    return builder.as_markup()
+
+
+def workers_menu() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Список воркеров", callback_data="workers:list")
+    builder.button(text="Выдать доступ", callback_data="workers:add")
+    builder.button(text="Забрать доступ", callback_data="workers:remove")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def workers_list_menu(workers: Sequence, *, action: str = "open", page: int = 0) -> InlineKeyboardMarkup:
+    pages = max(1, ceil(len(workers) / WORKERS_PER_PAGE))
+    page = max(0, min(page, pages - 1))
+    page_workers = workers[page * WORKERS_PER_PAGE:(page + 1) * WORKERS_PER_PAGE]
+    builder = InlineKeyboardBuilder()
+    for worker in page_workers:
+        full_name = " ".join(part for part in (worker.first_name, worker.last_name) if part).strip()
+        label = f"{(full_name or 'Без имени')[:38]} · {worker.user_id}"
+        callback_prefix = "workers:revoke_ask" if action == "remove" else "workers:open"
+        builder.button(text=label, callback_data=f"{callback_prefix}:{worker.user_id}")
+    page_prefix = "workers:remove_page" if action == "remove" else "workers:list_page"
+    if page > 0:
+        builder.button(text="‹ Назад", callback_data=f"{page_prefix}:{page - 1}")
+    if pages > 1:
+        builder.button(text=f"{page + 1}/{pages}", callback_data="noop")
+    if page + 1 < pages:
+        builder.button(text="Вперёд ›", callback_data=f"{page_prefix}:{page + 1}")
+    builder.button(text="Назад", callback_data="workers:menu")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def worker_detail_menu(worker_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Выдать / изменить лимит", callback_data=f"workers:limit:{worker_id}")
+    builder.button(text="Забрать доступ", callback_data=f"workers:revoke_ask:{worker_id}")
+    builder.button(text="Назад к списку", callback_data="workers:list")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def worker_revoke_confirm_menu(worker_id: int, *, step: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    if step == 1:
+        builder.button(text="Да, продолжить", callback_data=f"workers:revoke_again:{worker_id}")
+    else:
+        builder.button(text="ДА, ЗАБРАТЬ ДОСТУП", callback_data=f"workers:revoke_confirm:{worker_id}")
+    builder.button(text="Отмена", callback_data=f"workers:open:{worker_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def workers_cancel_menu() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Отмена", callback_data="workers:menu")
     return builder.as_markup()

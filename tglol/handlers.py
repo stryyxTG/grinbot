@@ -13,7 +13,7 @@ from typing import Any
 import zipfile
 
 from aiogram import BaseMiddleware, Bot, F, Router
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message, TelegramObject
 from telethon.errors import SessionPasswordNeededError
@@ -22,15 +22,24 @@ from tglol.bulk_input import parse_bulk_phone_input
 from tglol.config import Config
 from tglol.db import (
     add_account,
+    claim_accounts_for_worker,
     connect,
     count_accounts,
     count_accounts_by_stage,
     delete_account_row,
     delete_accounts_by_stage,
+    delete_worker,
     get_account,
+    get_worker,
     list_accounts,
     list_accounts_by_scope,
+    list_worker_stats,
+    list_workers,
+    reset_worker_limits,
+    save_worker,
     set_account_stage,
+    set_worker_limit,
+    update_worker_identity,
     update_account_status,
 )
 from tglol.desktop_profile import generated_account_json, random_desktop_runtime, utc_now_iso
@@ -50,6 +59,11 @@ from tglol.keyboards import (
     digit_code_keyboard,
     registration_filter_menu,
     registration_service_menu,
+    worker_detail_menu,
+    worker_revoke_confirm_menu,
+    workers_cancel_menu,
+    workers_list_menu,
+    workers_menu,
 )
 from tglol.paths import unique_path
 from tglol.registration import (
@@ -61,7 +75,7 @@ from tglol.registration import (
     services_from_storage,
     services_label,
 )
-from tglol.states import AddByBulkCode, AddByCode, AddByZip
+from tglol.states import AddByBulkCode, AddByCode, AddByZip, AddWorker, ChangeWorkerLimit
 from tglol.telegram_service import (
     get_latest_telegram_code,
     get_latest_verification_code,
@@ -96,18 +110,18 @@ class AccessMiddleware(BaseMiddleware):
 
         is_admin = user.id in config.admin_ids
         is_trigger_chat = bool(config.trigger_chat_id and chat_id is not None and chat_id == config.trigger_chat_id)
-        is_start_command = bool(text == "/start")
-
         if is_admin:
             return await handler(event, data)
 
-        if not config.trigger_chat_id:
-            return await handler(event, data)
-
-        if is_trigger_chat:
-            return await handler(event, data)
-
-        if is_start_command:
+        is_trigger_text = isinstance(event, Message) and bool(
+            re.search(r"\bтг\b", text, flags=re.IGNORECASE)
+        )
+        is_worker_code_button = (
+            isinstance(event, CallbackQuery)
+            and bool(event.data)
+            and event.data.startswith("account:request_code:")
+        )
+        if is_trigger_chat and (is_trigger_text or is_worker_code_button):
             return await handler(event, data)
 
         return None
@@ -136,6 +150,80 @@ def _username(value) -> str:
     if not username.startswith("@"):
         username = f"@{username}"
     return f"<code>{escape(username)}</code>"
+
+
+def _worker_name(worker) -> str:
+    return " ".join(
+        part for part in (worker.first_name, worker.last_name) if part
+    ).strip() or "Без имени"
+
+
+def _worker_text(worker) -> str:
+    username = f"@{worker.username}" if worker.username else "-"
+    return (
+        f"<b>{escape(_worker_name(worker))}</b>\n"
+        f"ID: <code>{worker.user_id}</code>\n"
+        f"Username: <code>{escape(username)}</code>\n"
+        f"Остаток лимита: <b>{worker.remaining_limit}</b>\n"
+        f"Лимит после /reset: <b>{worker.configured_limit}</b>"
+    )
+
+
+async def _send_code_report(message: Message, lines: list[str]) -> None:
+    """Send a long report as safe HTML preformatted chunks."""
+    chunks: list[str] = []
+    current: list[str] = []
+    current_length = 0
+    for raw_line in lines:
+        raw_text = str(raw_line)
+        raw_parts = [raw_text[index:index + 3000] for index in range(0, len(raw_text), 3000)] or [""]
+        for raw_part in raw_parts:
+            part = escape(raw_part)
+            extra = len(part) + (1 if current else 0)
+            if current and current_length + extra > 3500:
+                chunks.append("\n".join(current))
+                current = []
+                current_length = 0
+            current.append(part)
+            current_length += len(part) + (1 if len(current) > 1 else 0)
+    if current:
+        chunks.append("\n".join(current))
+    for chunk in chunks or ["Отчёт пуст."]:
+        await message.answer(f"<pre>{chunk}</pre>", parse_mode="HTML")
+
+
+def _parse_worker_limit(raw: str) -> int | None:
+    raw = (raw or "").strip()
+    if not raw.isdigit():
+        return None
+    value = int(raw)
+    return value if 1 <= value <= 100000 else None
+
+
+def _parse_telegram_user_id(raw: str) -> int | None:
+    raw = (raw or "").strip()
+    if not raw.isdigit():
+        return None
+    value = int(raw)
+    return value if 1 <= value <= 9_223_372_036_854_775_807 else None
+
+
+async def _resolve_worker_identity(bot: Bot, config: Config, user_id: int) -> tuple[str, str | None, str | None]:
+    if config.trigger_chat_id:
+        try:
+            member = await bot.get_chat_member(config.trigger_chat_id, user_id)
+            member_status = getattr(member.status, "value", member.status)
+            if member_status not in {"left", "kicked"}:
+                user = member.user
+                return user.first_name or "Без имени", user.last_name, user.username
+        except Exception:
+            pass
+    try:
+        chat = await bot.get_chat(user_id)
+        return chat.first_name or chat.title or "Без имени", chat.last_name, chat.username
+    except Exception as exc:
+        logger.info("Cannot resolve worker %s before granting access: %s", user_id, exc)
+        return "Имя пока неизвестно", None, None
 
 
 def _common_account_counts(config: Config) -> tuple[int, int]:
@@ -325,6 +413,35 @@ async def _give_out_accounts(message: Message, bot: Bot, config: Config) -> None
     if match:
         requested = int(match.group(1))
         requested = max(1, min(requested, 20))
+    requested_count = requested
+
+    requester_id = message.from_user.id if message.from_user else 0
+    is_admin = requester_id in config.admin_ids
+    worker = None if is_admin else get_worker(config, requester_id)
+    if not is_admin and worker is None:
+        await message.answer("У тебя нет доступа к получению аккаунтов.")
+        return
+    if worker is not None and message.from_user:
+        update_worker_identity(
+            config,
+            requester_id,
+            first_name=message.from_user.first_name or "Без имени",
+            last_name=message.from_user.last_name,
+            username=message.from_user.username,
+        )
+    if worker is not None and worker.remaining_limit <= 0:
+        claim_accounts_for_worker(
+            config,
+            [],
+            worker_id=requester_id,
+            requested_count=requested_count,
+        )
+        await message.answer("Твой лимит на получение аккаунтов закончился.")
+        return
+
+    limited_by_quota = bool(worker and requested > worker.remaining_limit)
+    if worker is not None:
+        requested = min(requested, worker.remaining_limit)
 
     accounts: list = []
     available_accounts = [account for account in list_accounts_by_scope(config) if account.account_stage != "issued"]
@@ -378,19 +495,35 @@ async def _give_out_accounts(message: Message, bot: Bot, config: Config) -> None
         if len(accounts) >= requested:
             break
 
-    if not accounts:
+    claimed_accounts = claim_accounts_for_worker(
+        config,
+        [account.id for account in accounts],
+        worker_id=None if is_admin else requester_id,
+        requested_count=requested_count,
+    )
+    if not claimed_accounts:
+        if worker is not None:
+            updated_worker = get_worker(config, requester_id)
+            if updated_worker is None:
+                await message.answer("Твой доступ к получению аккаунтов отозван.")
+                return
+            if updated_worker.remaining_limit <= 0:
+                await message.answer("Твой лимит на получение аккаунтов закончился.")
+                return
         await message.answer("Сейчас свободных аккаунтов нет.")
         return
 
-    for account in accounts:
-        set_account_stage(config, account.id, "issued")
-
-    for account in accounts:
+    for account in claimed_accounts:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Получить код для входа", callback_data=f"account:request_code:{account.id}:{message.chat.id}:{message.from_user.id if message.from_user else 0}")]])
         await message.answer(
             f"Аккаунт для входа\nНомер: {account.phone or '-'}\nID: {account.id}",
             reply_markup=keyboard,
         )
+    if worker is not None:
+        updated_worker = get_worker(config, requester_id)
+        remaining = updated_worker.remaining_limit if updated_worker else 0
+        prefix = "Запрос ограничен доступным лимитом. " if limited_by_quota else ""
+        await message.answer(f"{prefix}Остаток лимита: {remaining}.")
 
 
 def _delivery_type_label(raw_type: str | None) -> str:
@@ -626,6 +759,294 @@ async def _finalize_code_login_impl(
         ),
         reply_markup=accounts_menu(),
     )
+
+
+@router.message(F.text == "/cancel")
+async def cancel(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Отменено.", reply_markup=accounts_menu())
+
+
+@router.message(Command("reset"))
+async def reset_workers_command(message: Message, state: FSMContext, config: Config) -> None:
+    await state.clear()
+    results = reset_worker_limits(config)
+    lines = [
+        "╔══════════════════════════════╗",
+        "║       RESET ЛИМИТОВ          ║",
+        "╚══════════════════════════════╝",
+        f"Воркеров: {len(results)}",
+    ]
+    if not results:
+        lines.extend(["", "Список воркеров пуст."])
+    for index, result in enumerate(results, start=1):
+        worker = result.worker
+        name = " ".join(_worker_name(worker).split())
+        lines.extend(
+            [
+                "",
+                f"[{index}] {name}",
+                f"ID: {worker.user_id}",
+                f"Лимит: {result.previous_remaining} -> {worker.configured_limit}",
+                f"Восстановлено: +{result.restored_count}",
+                f"Триггеров за период: {result.trigger_count}",
+                f"Запрошено / выдано: {result.requested_count} / {result.issued_count}",
+                "──────────────────────────────",
+            ]
+        )
+    lines.extend(["", "Новый статистический период начат."])
+    await _send_code_report(message, lines)
+
+
+@router.message(Command("stats"))
+async def worker_stats_command(message: Message, state: FSMContext, config: Config) -> None:
+    await state.clear()
+    stats = list_worker_stats(config)
+    total_triggers = sum(item.trigger_count for item in stats)
+    total_requested = sum(item.requested_count for item in stats)
+    total_issued = sum(item.issued_count for item in stats)
+    lines = [
+        "╔══════════════════════════════╗",
+        "║      СТАТИСТИКА ВОРКЕРОВ     ║",
+        "╚══════════════════════════════╝",
+        "Период: после последнего /reset",
+        f"Воркеров: {len(stats)}",
+        f"Триггеров: {total_triggers}",
+        f"Запрошено: {total_requested}",
+        f"Выдано: {total_issued}",
+    ]
+    if not stats:
+        lines.extend(["", "Список воркеров пуст."])
+    for index, item in enumerate(stats, start=1):
+        worker = item.worker
+        name = " ".join(_worker_name(worker).split())
+        period_capacity = item.issued_count + worker.remaining_limit
+        exhausted_percent = round(item.issued_count * 100 / period_capacity) if period_capacity else 0
+        lines.extend(
+            [
+                "",
+                f"[{index}] {name}",
+                f"ID: {worker.user_id}",
+                f"Триггеров: {item.trigger_count}",
+                f"Запрошено: {item.requested_count}",
+                f"Выдано: {item.issued_count}",
+                f"Остаток лимита: {worker.remaining_limit}",
+                f"Исчерпал: {item.issued_count}/{period_capacity} ({exhausted_percent}%)",
+                "Аккаунты:",
+            ]
+        )
+        if item.phones:
+            lines.extend(f"  • {phone}" for phone in item.phones)
+        else:
+            lines.append("  — пока ничего не получал")
+        lines.append("──────────────────────────────")
+    await _send_code_report(message, lines)
+
+
+@router.message(Command("workers"))
+async def workers_command(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Управление воркерами", reply_markup=workers_menu())
+
+
+@router.callback_query(F.data == "workers:menu")
+async def show_workers_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.message.edit_text("Управление воркерами", reply_markup=workers_menu())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "workers:list")
+async def show_workers_list(callback: CallbackQuery, config: Config) -> None:
+    workers = list_workers(config)
+    text = f"Список воркеров · {len(workers)}" if workers else "Список воркеров пуст."
+    await callback.message.edit_text(text, reply_markup=workers_list_menu(workers))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("workers:list_page:"))
+async def show_workers_list_page(callback: CallbackQuery, config: Config) -> None:
+    page = int(callback.data.rsplit(":", 1)[-1])
+    workers = list_workers(config)
+    text = f"Список воркеров · {len(workers)}" if workers else "Список воркеров пуст."
+    await callback.message.edit_text(text, reply_markup=workers_list_menu(workers, page=page))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "workers:add")
+async def add_worker_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(AddWorker.waiting_user_id)
+    await callback.message.edit_text(
+        "Отправь Telegram ID человека, которому нужно выдать доступ.",
+        reply_markup=workers_cancel_menu(),
+    )
+    await callback.answer()
+
+
+@router.message(AddWorker.waiting_user_id)
+async def add_worker_user_id(message: Message, state: FSMContext, config: Config, bot: Bot) -> None:
+    user_id = _parse_telegram_user_id(message.text or "")
+    if user_id is None:
+        await message.answer("Нужен корректный числовой Telegram ID.", reply_markup=workers_cancel_menu())
+        return
+    if user_id in config.admin_ids:
+        await message.answer("Это владелец бота — у владельцев доступ без лимита.", reply_markup=workers_cancel_menu())
+        return
+    if get_worker(config, user_id):
+        await state.clear()
+        await message.answer("Этот человек уже есть в списке воркеров.", reply_markup=workers_menu())
+        return
+    try:
+        first_name, last_name, username = await _resolve_worker_identity(bot, config, user_id)
+    except RuntimeError as exc:
+        await message.answer(str(exc), reply_markup=workers_cancel_menu())
+        return
+    await state.update_data(
+        worker_user_id=user_id,
+        worker_first_name=first_name,
+        worker_last_name=last_name,
+        worker_username=username,
+    )
+    await state.set_state(AddWorker.waiting_limit)
+    full_name = " ".join(part for part in (first_name, last_name) if part)
+    await message.answer(
+        f"Найден: <b>{escape(full_name)}</b>\nID: <code>{user_id}</code>\n\nТеперь отправь лимит аккаунтов от 1 до 100000.",
+        reply_markup=workers_cancel_menu(),
+    )
+
+
+@router.message(AddWorker.waiting_limit)
+async def add_worker_limit(message: Message, state: FSMContext, config: Config) -> None:
+    limit = _parse_worker_limit(message.text or "")
+    if limit is None:
+        await message.answer("Лимит должен быть целым числом от 1 до 100000.", reply_markup=workers_cancel_menu())
+        return
+    data = await state.get_data()
+    user_id = int(data["worker_user_id"])
+    save_worker(
+        config,
+        user_id=user_id,
+        first_name=str(data["worker_first_name"]),
+        last_name=data.get("worker_last_name"),
+        username=data.get("worker_username"),
+        remaining_limit=limit,
+        created_by=message.from_user.id if message.from_user else None,
+    )
+    await state.clear()
+    worker = get_worker(config, user_id)
+    await message.answer(
+        f"Доступ выдан.\n\n{_worker_text(worker)}",
+        reply_markup=worker_detail_menu(user_id),
+    )
+
+
+@router.callback_query(F.data == "workers:remove")
+async def choose_worker_to_remove(callback: CallbackQuery, config: Config) -> None:
+    workers = list_workers(config)
+    text = "Выбери воркера, у которого нужно забрать доступ." if workers else "Список воркеров пуст."
+    await callback.message.edit_text(text, reply_markup=workers_list_menu(workers, action="remove"))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("workers:remove_page:"))
+async def choose_worker_to_remove_page(callback: CallbackQuery, config: Config) -> None:
+    page = int(callback.data.rsplit(":", 1)[-1])
+    workers = list_workers(config)
+    text = "Выбери воркера, у которого нужно забрать доступ." if workers else "Список воркеров пуст."
+    await callback.message.edit_text(text, reply_markup=workers_list_menu(workers, action="remove", page=page))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("workers:open:"))
+async def show_worker_detail(callback: CallbackQuery, config: Config) -> None:
+    user_id = int(callback.data.rsplit(":", 1)[-1])
+    worker = get_worker(config, user_id)
+    if not worker:
+        await callback.answer("Воркер уже удалён.", show_alert=True)
+        return
+    await callback.message.edit_text(_worker_text(worker), reply_markup=worker_detail_menu(user_id))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("workers:limit:"))
+async def change_worker_limit_start(callback: CallbackQuery, state: FSMContext, config: Config) -> None:
+    user_id = int(callback.data.rsplit(":", 1)[-1])
+    worker = get_worker(config, user_id)
+    if not worker:
+        await callback.answer("Воркер уже удалён.", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(worker_user_id=user_id)
+    await state.set_state(ChangeWorkerLimit.waiting_limit)
+    await callback.message.edit_text(
+        f"{_worker_text(worker)}\n\nОтправь новый остаток лимита от 1 до 100000.",
+        reply_markup=workers_cancel_menu(),
+    )
+    await callback.answer()
+
+
+@router.message(ChangeWorkerLimit.waiting_limit)
+async def change_worker_limit(message: Message, state: FSMContext, config: Config) -> None:
+    limit = _parse_worker_limit(message.text or "")
+    if limit is None:
+        await message.answer("Лимит должен быть целым числом от 1 до 100000.", reply_markup=workers_cancel_menu())
+        return
+    data = await state.get_data()
+    user_id = int(data["worker_user_id"])
+    if not set_worker_limit(config, user_id, limit):
+        await state.clear()
+        await message.answer("Воркер уже удалён.", reply_markup=workers_menu())
+        return
+    await state.clear()
+    worker = get_worker(config, user_id)
+    await message.answer(
+        f"Новый лимит установлен.\n\n{_worker_text(worker)}",
+        reply_markup=worker_detail_menu(user_id),
+    )
+
+
+@router.callback_query(F.data.startswith("workers:revoke_ask:"))
+async def revoke_worker_first(callback: CallbackQuery, config: Config) -> None:
+    user_id = int(callback.data.rsplit(":", 1)[-1])
+    worker = get_worker(config, user_id)
+    if not worker:
+        await callback.answer("Воркер уже удалён.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"{_worker_text(worker)}\n\nТочно хочешь забрать у этого человека доступ?",
+        reply_markup=worker_revoke_confirm_menu(user_id, step=1),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("workers:revoke_again:"))
+async def revoke_worker_second(callback: CallbackQuery, config: Config) -> None:
+    user_id = int(callback.data.rsplit(":", 1)[-1])
+    worker = get_worker(config, user_id)
+    if not worker:
+        await callback.answer("Воркер уже удалён.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"{_worker_text(worker)}\n\nПоследнее подтверждение: доступ будет отозван сразу.",
+        reply_markup=worker_revoke_confirm_menu(user_id, step=2),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("workers:revoke_confirm:"))
+async def revoke_worker_confirm(callback: CallbackQuery, config: Config) -> None:
+    user_id = int(callback.data.rsplit(":", 1)[-1])
+    worker = get_worker(config, user_id)
+    if not worker:
+        await callback.answer("Воркер уже удалён.", show_alert=True)
+        return
+    delete_worker(config, user_id)
+    await callback.message.edit_text(
+        f"Доступ отозван.\n\n{escape(_worker_name(worker))}\nID: <code>{worker.user_id}</code>",
+        reply_markup=workers_menu(),
+    )
+    await callback.answer("Доступ отозван.")
 
 
 @router.callback_query(F.data == "noop")
@@ -1116,12 +1537,6 @@ async def trigger_account_giveout(message: Message, state: FSMContext, bot: Bot,
     await _give_out_accounts(message, bot, config)
 
 
-@router.message(F.text == "/cancel")
-async def cancel(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await message.answer("Отменено.", reply_markup=accounts_menu())
-
-
 @router.callback_query(F.data.startswith("accounts:page:"))
 async def show_accounts_page(callback: CallbackQuery, state: FSMContext, config: Config) -> None:
     await state.clear()
@@ -1288,7 +1703,21 @@ async def request_account_code(callback: CallbackQuery, config: Config, bot: Bot
     if len(parts) < 5:
         await callback.answer("Некорректный запрос.", show_alert=True)
         return
-    account_id = int(parts[2])
+    try:
+        account_id = int(parts[2])
+        expected_chat_id = int(parts[3])
+        expected_user_id = int(parts[4])
+    except ValueError:
+        await callback.answer("Некорректный запрос.", show_alert=True)
+        return
+    actual_chat_id = callback.message.chat.id if callback.message else None
+    actual_user_id = callback.from_user.id if callback.from_user else None
+    if actual_chat_id != expected_chat_id or actual_user_id != expected_user_id:
+        await callback.answer("Эта кнопка предназначена другому пользователю.", show_alert=True)
+        return
+    if actual_user_id not in config.admin_ids and not get_worker(config, actual_user_id):
+        await callback.answer("Доступ к получению аккаунтов отозван.", show_alert=True)
+        return
     account = get_account(config, account_id)
     if not account:
         await callback.answer("Аккаунт не найден.", show_alert=True)
