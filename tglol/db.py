@@ -388,6 +388,37 @@ def list_worker_stats(config: Config) -> list[WorkerStats]:
         return _worker_stats_from_connection(connection)
 
 
+def reset_worker_limit(config: Config, user_id: int) -> WorkerResetResult | None:
+    """Reset one worker's quota and statistics without affecting other workers."""
+    with connect(config) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        item = next(
+            (stats for stats in _worker_stats_from_connection(connection) if stats.worker.user_id == user_id),
+            None,
+        )
+        if item is None:
+            return None
+        result = WorkerResetResult(
+            worker=item.worker,
+            previous_remaining=item.worker.remaining_limit,
+            restored_count=max(0, item.worker.configured_limit - item.worker.remaining_limit),
+            trigger_count=item.trigger_count,
+            requested_count=item.requested_count,
+            issued_count=item.issued_count,
+        )
+        connection.execute(
+            """
+            UPDATE workers
+            SET remaining_limit = configured_limit, updated_at = datetime('now')
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        )
+        connection.execute("DELETE FROM worker_issues WHERE worker_id = ?", (user_id,))
+        connection.execute("DELETE FROM worker_requests WHERE worker_id = ?", (user_id,))
+        return result
+
+
 def reset_worker_limits(config: Config) -> list[WorkerResetResult]:
     """Restore configured limits and start a fresh statistics period."""
     with connect(config) as connection:

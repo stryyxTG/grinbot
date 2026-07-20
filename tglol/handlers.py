@@ -35,6 +35,7 @@ from tglol.db import (
     list_accounts_by_scope,
     list_worker_stats,
     list_workers,
+    reset_worker_limit,
     reset_worker_limits,
     save_worker,
     set_account_stage,
@@ -60,6 +61,7 @@ from tglol.keyboards import (
     registration_filter_menu,
     registration_service_menu,
     worker_detail_menu,
+    worker_reset_confirm_menu,
     worker_revoke_confirm_menu,
     workers_cancel_menu,
     workers_list_menu,
@@ -1004,6 +1006,51 @@ async def change_worker_limit(message: Message, state: FSMContext, config: Confi
         f"Новый лимит установлен.\n\n{_worker_text(worker)}",
         reply_markup=worker_detail_menu(user_id),
     )
+
+
+@router.callback_query(F.data.startswith("workers:reset_ask:"))
+async def reset_worker_limit_ask(callback: CallbackQuery, config: Config) -> None:
+    user_id = int(callback.data.rsplit(":", 1)[-1])
+    worker = get_worker(config, user_id)
+    if not worker:
+        await callback.answer("Воркер уже удалён.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"{_worker_text(worker)}\n\n"
+        f"Сбросить остаток до <b>{worker.configured_limit}</b>? "
+        "Статистика текущего периода только этого воркера будет очищена.",
+        reply_markup=worker_reset_confirm_menu(user_id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("workers:reset_confirm:"))
+async def reset_worker_limit_confirm(callback: CallbackQuery, config: Config) -> None:
+    user_id = int(callback.data.rsplit(":", 1)[-1])
+    result = reset_worker_limit(config, user_id)
+    if result is None:
+        await callback.answer("Воркер уже удалён.", show_alert=True)
+        return
+    worker = result.worker
+    report = "\n".join(
+        [
+            "╔══════════════════════════════╗",
+            "║    СБРОС ЛИМИТА ВОРКЕРА      ║",
+            "╚══════════════════════════════╝",
+            f"Имя: {' '.join(_worker_name(worker).split())}",
+            f"ID: {worker.user_id}",
+            f"Лимит: {result.previous_remaining} -> {worker.configured_limit}",
+            f"Восстановлено: +{result.restored_count}",
+            f"Триггеров очищено: {result.trigger_count}",
+            f"Запрошено / выдано: {result.requested_count} / {result.issued_count}",
+            "Новый период для воркера начат.",
+        ]
+    )
+    await callback.message.edit_text(
+        f"<pre>{escape(report)}</pre>",
+        reply_markup=worker_detail_menu(user_id),
+    )
+    await callback.answer("Лимит сброшен.")
 
 
 @router.callback_query(F.data.startswith("workers:revoke_ask:"))

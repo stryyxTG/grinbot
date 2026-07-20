@@ -17,11 +17,12 @@ from tglol.db import (
     list_worker_stats,
     list_workers,
     reset_worker_limits,
+    reset_worker_limit,
     save_worker,
     set_worker_limit,
     update_worker_identity,
 )
-from tglol.keyboards import workers_list_menu
+from tglol.keyboards import worker_detail_menu, workers_list_menu
 
 
 class WorkerQuotaTests(unittest.TestCase):
@@ -162,6 +163,35 @@ class WorkerQuotaTests(unittest.TestCase):
         self.assertEqual(fresh_stats.requested_count, 0)
         self.assertEqual(fresh_stats.issued_count, 0)
         self.assertEqual(fresh_stats.phones, ())
+
+    def test_single_worker_reset_does_not_touch_others(self):
+        first_id = self.add_account("30001")
+        second_id = self.add_account("30002")
+        for user_id, name in ((77, "Anna"), (78, "Boris")):
+            save_worker(
+                self.config,
+                user_id=user_id,
+                first_name=name,
+                last_name=None,
+                username=None,
+                remaining_limit=2,
+                created_by=1,
+            )
+        claim_accounts_for_worker(self.config, [first_id], worker_id=77, requested_count=1)
+        claim_accounts_for_worker(self.config, [second_id], worker_id=78, requested_count=1)
+
+        result = reset_worker_limit(self.config, 77)
+        self.assertEqual(result.restored_count, 1)
+        self.assertEqual(get_worker(self.config, 77).remaining_limit, 2)
+        self.assertEqual(get_worker(self.config, 78).remaining_limit, 1)
+        stats = {item.worker.user_id: item for item in list_worker_stats(self.config)}
+        self.assertEqual(stats[77].issued_count, 0)
+        self.assertEqual(stats[78].issued_count, 1)
+
+    def test_worker_card_has_reset_button(self):
+        keyboard = worker_detail_menu(42)
+        callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
+        self.assertIn("workers:reset_ask:42", callbacks)
 
     def test_worker_list_is_paginated(self):
         workers = [

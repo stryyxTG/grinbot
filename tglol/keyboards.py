@@ -279,8 +279,17 @@ def workers_list_menu(workers: Sequence, *, action: str = "open", page: int = 0)
 def worker_detail_menu(worker_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="Выдать / изменить лимит", callback_data=f"workers:limit:{worker_id}")
+    builder.button(text="Сбросить лимит", callback_data=f"workers:reset_ask:{worker_id}")
     builder.button(text="Забрать доступ", callback_data=f"workers:revoke_ask:{worker_id}")
     builder.button(text="Назад к списку", callback_data="workers:list")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def worker_reset_confirm_menu(worker_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Да, сбросить лимит", callback_data=f"workers:reset_confirm:{worker_id}")
+    builder.button(text="Отмена", callback_data=f"workers:open:{worker_id}")
     builder.adjust(1)
     return builder.as_markup()
 
